@@ -84,6 +84,9 @@ PausableUpgradeable
 
     /// @dev Percentage of purchase amount awarded to referrer (with 2 decimals: 500 = 5%)
     uint256 public referralRewardPercent;
+    
+    /// @dev Percentage of bonus tokens awarded to referee (buyer using referral code) (2 decimals: 1000 = 10%)
+    uint256 public refereeRewardPercent;
 
     /// @dev Mapping to track who referred whom (buyer => referrer)
     mapping(address => address) public referrerOf;
@@ -123,6 +126,12 @@ PausableUpgradeable
 
     /// @dev Current presale round
     uint256 public currentRound;
+
+    /// @dev Duration of each round in seconds (default: 5 days)
+    uint256 public roundDuration;
+
+    /// @dev Mapping of round number to its start time
+    mapping(uint256 => uint256) public roundStartTime;
 
     /// @dev Reward type enum for referral payouts
     enum RewardType { USDT, TOKEN }
@@ -191,6 +200,13 @@ PausableUpgradeable
         uint256 rewardAmount
     );
 
+    /// @dev Emitted when referral tokens are automatically added to claimable balance
+    event ReferralTokensAdded(
+        address indexed referrer,
+        uint256 tokensAdded,
+        uint256 usdReward
+    );
+
     // TokensClaimed event removed - tokens distributed after TGE
 
     /// @dev Emitted when referral rewards are claimed
@@ -231,6 +247,20 @@ PausableUpgradeable
         uint256 newPercent
     );
 
+    /// @dev Emitted when referee reward percentage is updated
+    event RefereeRewardPercentUpdated(
+        uint256 oldPercent,
+        uint256 newPercent
+    );
+
+    /// @dev Emitted when referee receives bonus tokens
+    event RefereeBonusTokensAwarded(
+        address indexed referee,
+        address indexed referrer,
+        uint256 bonusTokens,
+        uint256 usdAmount
+    );
+
     /// @dev Emitted when accepted stablecoin status is updated
     event AcceptedStablecoinUpdated(
         address indexed stablecoin,
@@ -254,6 +284,12 @@ PausableUpgradeable
         uint256 oldStartTime,
         uint256 oldEndTime,
         uint256 newStartTime,
+        uint256 newEndTime
+    );
+
+    /// @dev Emitted when presale end time is extended
+    event PresaleEndTimeExtended(
+        uint256 oldEndTime,
         uint256 newEndTime
     );
 
@@ -286,6 +322,12 @@ PausableUpgradeable
     event PriceFeedStalenessThresholdUpdated(
         uint256 oldThreshold,
         uint256 newThreshold
+    );
+
+    /// @dev Emitted when round duration is updated
+    event RoundDurationUpdated(
+        uint256 oldDuration,
+        uint256 newDuration
     );
 
     /// @dev Emitted when contract is paused
@@ -334,6 +376,7 @@ PausableUpgradeable
     /// @param _ETHPriceFeed Address of ETH/USD Chainlink price feed
     /// @param _USDTPriceFeed Address of USDT/USD Chainlink price feed
     /// @param _referralRewardPercent Referral reward percentage (2 decimals)
+    /// @param _refereeRewardPercent Referee reward percentage for bonus tokens (2 decimals)
     /// @param _walletA Address for 10% fund allocation
     /// @param _walletB Address for 2% fund allocation 
     /// @param _treasuryWallet Address for 88% fund allocation
@@ -346,6 +389,7 @@ PausableUpgradeable
         address _ETHPriceFeed,
         address _USDTPriceFeed,
         uint256 _referralRewardPercent,
+        uint256 _refereeRewardPercent,
         address _walletA,
         address _walletB,
         address _treasuryWallet
@@ -368,6 +412,7 @@ PausableUpgradeable
         ETHPriceFeed = AggregatorV3Interface(_ETHPriceFeed);
         USDTPriceFeed = AggregatorV3Interface(_USDTPriceFeed);
         referralRewardPercent = _referralRewardPercent;
+        refereeRewardPercent = _refereeRewardPercent;
 
         // Set fund routing wallets
         require(_walletA != address(0), "Invalid wallet A");
@@ -379,6 +424,8 @@ PausableUpgradeable
 
         // Initialize round and referral reward types
         currentRound = 1;
+        roundDuration = 5 days; // Set default round duration to 5 days
+        roundStartTime[1] = _startTime; // First round starts when presale starts
         referralRewardType[1] = RewardType.USDT;
         referralRewardType[2] = RewardType.USDT;
         // Round 3+ defaults to TOKEN (RewardType.TOKEN = 1)
@@ -509,7 +556,8 @@ PausableUpgradeable
         // Process the purchase with actual received amount
         _processPurchase(msg.sender, actualUsdAmount, _referrer, stablecoin, actualAmount);
 
-        // Note: Stablecoin distribution handled in admin withdrawal
+        // Distribute stablecoin funds immediately (same as ETH)
+        _distributeStablecoinFunds(stablecoin, actualAmount);
     }
 
     // ============ INTERNAL FUNCTIONS ============
@@ -568,6 +616,17 @@ PausableUpgradeable
             tokensToGive = (usdAmount * 1e18) / tokenPriceUSD;
         }
 
+        // Calculate referee bonus tokens if referral is provided and valid
+        uint256 bonusTokens = 0;
+        if (_referrer != address(0) && _referrer != buyer && refereeRewardPercent > 0) {
+            // Calculate bonus tokens based on referee reward percentage
+            bonusTokens = (tokensToGive * refereeRewardPercent) / 10000;
+            tokensToGive += bonusTokens; // Add bonus tokens to the buyer's allocation
+            
+            // Emit referee bonus event
+            emit RefereeBonusTokensAwarded(buyer, _referrer, bonusTokens, usdAmount);
+        }
+
         // Update purchase tracking
         tokensPurchased[buyer] += tokensToGive;
         contributionsUSD[buyer] += usdAmount;
@@ -616,8 +675,22 @@ PausableUpgradeable
             referralRewardsUSDT[_referrer] += referralReward;
             totalReferralRewardsAllocatedUSDT += referralReward;
         } else {
+            // TOKEN rewards - automatically add to purchased tokens (immediate ownership)
             referralRewardsTOKEN[_referrer] += referralReward;
             totalReferralRewardsAllocatedTOKEN += referralReward;
+            
+            // Calculate tokens to add (USD amount / token price)
+            uint256 tokensToAdd;
+            if (referralReward > type(uint256).max / 1e18) {
+                tokensToAdd = (referralReward / tokenPriceUSD) * 1e18;
+            } else {
+                tokensToAdd = (referralReward * 1e18) / tokenPriceUSD;
+            }
+            
+            // Automatically add tokens to referrer's purchased balance (immediate ownership, no claiming needed)
+            tokensPurchased[_referrer] += tokensToAdd;
+            
+            emit ReferralTokensAdded(_referrer, tokensToAdd, referralReward);
         }
         
         // Keep legacy tracking for backward compatibility
@@ -646,6 +719,27 @@ PausableUpgradeable
             (bool successTreasury, ) = payable(treasuryWallet).call{value: toTreasury}("");
             require(successTreasury, "Transfer to treasury failed");
         }
+
+        emit FundsDistributed(toWalletA, toWalletB, toTreasury);
+    }
+
+    /// @dev Internal function to distribute stablecoin funds to wallets
+    /// @param stablecoin Address of the stablecoin contract
+    /// @param amount Amount to distribute
+    function _distributeStablecoinFunds(address stablecoin, uint256 amount) internal {
+        require(stablecoin != address(0), "Invalid stablecoin");
+        require(acceptedStablecoins[stablecoin], "Stablecoin not accepted");
+        
+        uint256 toWalletA = (amount * walletAPercent) / 10000;
+        uint256 toWalletB = (amount * walletBPercent) / 10000;
+        uint256 toTreasury = (amount * treasuryPercent) / 10000;
+
+        IERC20 token = IERC20(stablecoin);
+        
+        // Transfer stablecoins to designated wallets
+        token.safeTransfer(walletA, toWalletA);
+        token.safeTransfer(walletB, toWalletB);
+        token.safeTransfer(treasuryWallet, toTreasury);
 
         emit FundsDistributed(toWalletA, toWalletB, toTreasury);
     }
@@ -787,6 +881,66 @@ PausableUpgradeable
         referralRewards[msg.sender] = 0;
     }
 
+    // ============ BATCH DISTRIBUTION FUNCTIONS ============
+
+    /// @dev Allows owner to distribute referral rewards to multiple referrers in batch
+    /// @param referrers Array of referrer addresses to distribute rewards to
+    function batchDistributeReferralRewards(address[] calldata referrers) external onlyOwner nonReentrant {
+        require(referrers.length > 0, "No referrers provided");
+        require(referrers.length <= 100, "Too many referrers (max 100)");
+        
+        address usdtAddress = _getAcceptedStablecoin();
+        require(usdtAddress != address(0), "USDT not configured");
+        
+        IERC20 usdt = IERC20(usdtAddress);
+        uint8 usdtDecimals;
+        
+        // Get USDT decimals
+        try IERC20Metadata(usdtAddress).decimals() returns (uint8 d) {
+            usdtDecimals = d;
+        } catch {
+            usdtDecimals = 6; // Default for USDT
+        }
+        
+        uint256 totalDistributed = 0;
+        uint256 successCount = 0;
+        
+        for (uint256 i = 0; i < referrers.length; i++) {
+            address referrer = referrers[i];
+            uint256 usdtRewards = referralRewardsUSDT[referrer];
+            
+            if (usdtRewards > 0) {
+                // Clear the rewards first (prevents reentrancy)
+                referralRewardsUSDT[referrer] = 0;
+                
+                // Update legacy tracking
+                if (referralRewards[referrer] >= usdtRewards) {
+                    referralRewards[referrer] -= usdtRewards;
+                }
+                
+                // Calculate USDT amount based on decimals
+                uint256 usdtAmount;
+                if (usdtDecimals < 18) {
+                    usdtAmount = usdtRewards / (10 ** (18 - usdtDecimals));
+                } else if (usdtDecimals > 18) {
+                    usdtAmount = usdtRewards * (10 ** (usdtDecimals - 18));
+                } else {
+                    usdtAmount = usdtRewards;
+                }
+                
+                // Transfer USDT to referrer
+                usdt.safeTransfer(referrer, usdtAmount);
+                
+                totalDistributed += usdtRewards;
+                successCount++;
+                
+                emit ReferralRewardClaimed(referrer, usdtAmount);
+            }
+        }
+        
+        require(successCount > 0, "No rewards distributed");
+    }
+
     // ============ PRICE FEED FUNCTIONS ============
 
     /// @dev Gets the latest ETH price in USD from Chainlink with comprehensive validation
@@ -798,6 +952,8 @@ PausableUpgradeable
         require(price > 0, "Chainlink ETH price <= 0");
         require(answeredInRound >= roundID, "Stale ETH price");
         require(updatedAt != 0, "ETH round not complete");
+        require(startedAt != 0, "Invalid round start time");
+        require(updatedAt >= startedAt, "Invalid timestamps");
         require(block.timestamp - updatedAt < priceFeedStalenessThreshold + 1, "ETH price data is stale");
 
         // Chainlink price feeds have 8 decimals, convert to 18
@@ -829,12 +985,35 @@ PausableUpgradeable
         return endTime - block.timestamp;
     }
 
+    /// @dev Returns remaining time for the current round
+    /// @return timeLeft Seconds remaining in current round (0 if round ended)
+    function getRoundTimeLeft() external view returns (uint256) {
+        // Get the start time of the current round
+        uint256 roundStart = roundStartTime[currentRound];
+        
+        // If round hasn't started yet (shouldn't happen in normal flow)
+        if (roundStart <= 0 || block.timestamp < roundStart) {
+            return roundDuration;
+        }
+        
+        // Calculate round end time
+        uint256 roundEndTime = roundStart + roundDuration;
+        
+        // If current time is past round end time, return 0
+        if (block.timestamp >= roundEndTime) {
+            return 0;
+        }
+        
+        // Return remaining time
+        return roundEndTime - block.timestamp;
+    }
+
     /// @dev Calculates vested token amount for a user with overflow protection
     /// @param user Address to calculate vested amount for
     /// @return amount Vested token amount available for claiming
     function _calculateVestedAmount(address user) internal view returns (uint256) {
         uint256 totalClaimable = claimableTokens[user];
-        if (totalClaimable == 0) return 0;
+        if (totalClaimable <= 0) return 0;
         
         // If no vesting schedule, return all tokens
         if (vestingSchedule.startTime == 0 || vestingSchedule.duration == 0) {
@@ -931,6 +1110,15 @@ PausableUpgradeable
         uint256 oldPercent = referralRewardPercent;
         referralRewardPercent = _referralRewardPercent;
         emit ReferralRewardPercentUpdated(oldPercent, _referralRewardPercent);
+    }
+
+    /// @dev Updates referee reward percentage (only owner)
+    /// @param _refereeRewardPercent New referee reward percentage in basis points (e.g., 1000 = 10%)
+    function setRefereeRewardPercent(uint256 _refereeRewardPercent) external onlyOwner {
+        require(_refereeRewardPercent < 10001, "Referee reward > 100%");
+        uint256 oldPercent = refereeRewardPercent;
+        refereeRewardPercent = _refereeRewardPercent;
+        emit RefereeRewardPercentUpdated(oldPercent, _refereeRewardPercent);
     }
 
     /// @dev Adds or removes accepted stablecoins (only owner)
@@ -1034,6 +1222,17 @@ PausableUpgradeable
         emit PresaleTimingUpdated(oldStartTime, oldEndTime, _startTime, _endTime);
     }
 
+    /// @dev Extends presale end time (only owner, can be called during active presale)
+    /// @param _newEndTime New end time (must be later than current end time)
+    function extendPresaleEndTime(uint256 _newEndTime) external onlyOwner {
+        require(_newEndTime > endTime, "New end time must be later");
+        require(_newEndTime > block.timestamp, "End time must be future");
+
+        uint256 oldEndTime = endTime;
+        endTime = _newEndTime;
+        emit PresaleEndTimeExtended(oldEndTime, _newEndTime);
+    }
+
     /// @dev Sets referral reward type for a specific round
     /// @param round Round number
     /// @param rewardType USDT or TOKEN reward type
@@ -1042,13 +1241,25 @@ PausableUpgradeable
         referralRewardType[round] = rewardType;
     }
 
-    /// @dev Sets current presale round
+    /// @dev Sets current presale round and resets the round timer
     /// @param round New round number
     function setCurrentRound(uint256 round) external onlyOwner {
         require(round != 0, "Invalid round");
         RewardType rewardType = _getReferralRewardType(round);
         currentRound = round;
+        // Set the start time for the new round to current timestamp
+        roundStartTime[round] = block.timestamp;
         emit RoundChanged(round, rewardType);
+    }
+
+    /// @dev Sets the duration for each round (only owner)
+    /// @param duration Duration in seconds (e.g., 5 days = 432000)
+    function setRoundDuration(uint256 duration) external onlyOwner {
+        require(duration > 0, "Duration must be positive");
+        require(duration <= 30 days, "Duration too long"); // Maximum 30 days for safety
+        uint256 oldDuration = roundDuration;
+        roundDuration = duration;
+        emit RoundDurationUpdated(oldDuration, duration);
     }
 
     /// @dev Sets fund routing wallet addresses
@@ -1235,7 +1446,7 @@ PausableUpgradeable
     /// @dev Returns the current contract version for upgrade validation
     /// @return version Current implementation version
     function getVersion() external pure returns (uint256) {
-        return 1;
+        return 2; // Version 2: Added round timing functionality
     }
 
     /// @dev Fallback function to handle calls to non-existent functions
