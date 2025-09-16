@@ -79,8 +79,9 @@ PausableUpgradeable
     /// @dev Chainlink price feed for ETH/USD
     AggregatorV3Interface public ETHPriceFeed;
 
-    /// @dev Chainlink price feed for USDT/USD
-    AggregatorV3Interface public USDTPriceFeed;
+    /// @dev Mapping of stablecoin addresses to their Chainlink price feeds
+    /// @notice Allows different price feeds for different stablecoins (USDT, USDC, xcDOT, etc.)
+    mapping(address => AggregatorV3Interface) public stablecoinPriceFeeds;
 
     /// @dev Percentage of purchase amount awarded to referrer (with 2 decimals: 500 = 5%)
     uint256 public referralRewardPercent;
@@ -100,9 +101,6 @@ PausableUpgradeable
     /// @dev Mapping to track TOKEN referral rewards owed to each referrer
     mapping(address => uint256) public referralRewardsTOKEN;
 
-    /// @dev Total referral rewards allocated (for reserve tracking)
-    uint256 public totalReferralRewardsAllocated;
-    
     /// @dev Total USDT referral rewards allocated
     uint256 public totalReferralRewardsAllocatedUSDT;
     
@@ -139,23 +137,6 @@ PausableUpgradeable
     /// @dev Mapping of round to reward type
     mapping(uint256 => RewardType) public referralRewardType;
 
-    /// @dev Vesting schedule for token claims
-    struct VestingSchedule {
-        uint256 cliff;          // Cliff period in seconds
-        uint256 duration;       // Total vesting duration in seconds
-        uint256 startTime;      // Vesting start time
-        bool revocable;         // Whether vesting can be revoked
-    }
-
-    /// @dev Global vesting schedule
-    VestingSchedule public vestingSchedule;
-
-    /// @dev Track vested amounts for each user
-    mapping(address => uint256) public vestedTokens;
-
-    /// @dev Track if user has started vesting
-    mapping(address => bool) public vestingStarted;
-
     /// @dev Maximum allowed staleness for price feeds (configurable)
     uint256 public priceFeedStalenessThreshold;
     
@@ -170,8 +151,6 @@ PausableUpgradeable
     /// @dev Primary stablecoin for referral payouts (typically USDT)
     address public primaryStablecoin;
     
-    /// @dev Total tokens allocated to all users across all purchases
-    uint256 public totalClaimableTokens;
     
     /// @dev Mapping of authorized implementation addresses for upgrades
     mapping(address => bool) public authorizedImplementations;
@@ -228,13 +207,6 @@ PausableUpgradeable
         RewardType rewardType
     );
 
-    /// @dev Emitted when vesting schedule is configured
-    event VestingConfigured(
-        uint256 cliff,
-        uint256 duration,
-        uint256 startTime
-    );
-
     /// @dev Emitted when token price is updated
     event TokenPriceUpdated(
         uint256 oldPrice,
@@ -273,10 +245,10 @@ PausableUpgradeable
         address indexed newStablecoin
     );
 
-    /// @dev Emitted when price feeds are updated
-    event PriceFeedsUpdated(
-        address indexed ethPriceFeed,
-        address indexed usdtPriceFeed
+    /// @dev Emitted when ETH price feed is updated
+    event ETHPriceFeedUpdated(
+        address indexed oldPriceFeed,
+        address indexed newPriceFeed
     );
 
     /// @dev Emitted when presale timing is updated
@@ -291,6 +263,12 @@ PausableUpgradeable
     event PresaleEndTimeExtended(
         uint256 oldEndTime,
         uint256 newEndTime
+    );
+
+    /// @dev Emitted when stablecoin price feed is updated
+    event StablecoinPriceFeedUpdated(
+        address indexed stablecoin,
+        address indexed priceFeed
     );
 
     /// @dev Emitted when fund wallets are updated
@@ -374,7 +352,6 @@ PausableUpgradeable
     /// @param _endTime Presale end timestamp
     /// @param _hardCapUSD Maximum USD to raise (18 decimals)
     /// @param _ETHPriceFeed Address of ETH/USD Chainlink price feed
-    /// @param _USDTPriceFeed Address of USDT/USD Chainlink price feed
     /// @param _referralRewardPercent Referral reward percentage (2 decimals)
     /// @param _refereeRewardPercent Referee reward percentage for bonus tokens (2 decimals)
     /// @param _walletA Address for 10% fund allocation
@@ -387,7 +364,6 @@ PausableUpgradeable
         uint256 _endTime,
         uint256 _hardCapUSD,
         address _ETHPriceFeed,
-        address _USDTPriceFeed,
         uint256 _referralRewardPercent,
         uint256 _refereeRewardPercent,
         address _walletA,
@@ -401,7 +377,7 @@ PausableUpgradeable
         __Pausable_init();
 
         // Validate critical parameters
-        _validateInitParams(_mandalaToken, _tokenPriceUSD, _startTime, _endTime, _hardCapUSD, _ETHPriceFeed, _USDTPriceFeed, _referralRewardPercent);
+        _validateInitParams(_mandalaToken, _tokenPriceUSD, _startTime, _endTime, _hardCapUSD, _ETHPriceFeed, _referralRewardPercent);
 
         // Set initial values
         mandalaToken = IERC20(_mandalaToken);
@@ -410,7 +386,6 @@ PausableUpgradeable
         endTime = _endTime;
         hardCapUSD = _hardCapUSD;
         ETHPriceFeed = AggregatorV3Interface(_ETHPriceFeed);
-        USDTPriceFeed = AggregatorV3Interface(_USDTPriceFeed);
         referralRewardPercent = _referralRewardPercent;
         refereeRewardPercent = _refereeRewardPercent;
 
@@ -499,7 +474,7 @@ PausableUpgradeable
         // Get stablecoin decimals and convert to USD (18 decimals)
         IERC20 stablecoinContract = IERC20(stablecoin);
         uint8 decimals;
-        
+
         // Safely get decimals from the token contract
         try IERC20Metadata(stablecoin).decimals() returns (uint8 d) {
             decimals = d;
@@ -507,15 +482,31 @@ PausableUpgradeable
             // Revert if token doesn't support ERC20Metadata decimals() function
             revert("Token needs decimals()");
         }
-        
-        // Convert to 18 decimals for internal USD calculations
+
+        // Get USD price from Chainlink if price feed is configured for this stablecoin
         uint256 usdAmount;
-        if (decimals <= 17) {
-            usdAmount = amount * (10 ** (18 - decimals));
-        } else if (decimals >= 19) {
-            usdAmount = amount / (10 ** (decimals - 18));
+        if (address(stablecoinPriceFeeds[stablecoin]) != address(0)) {
+            // Use Chainlink price feed to get the actual USD value
+            uint256 stablecoinPriceUSD = getStablecoinPriceUSD(stablecoin);
+            // Calculate USD amount based on actual price
+            if (decimals <= 17) {
+                uint256 normalizedAmount = amount * (10 ** (18 - decimals));
+                usdAmount = (normalizedAmount * stablecoinPriceUSD) / 1e18;
+            } else if (decimals >= 19) {
+                uint256 normalizedAmount = amount / (10 ** (decimals - 18));
+                usdAmount = (normalizedAmount * stablecoinPriceUSD) / 1e18;
+            } else {
+                usdAmount = (amount * stablecoinPriceUSD) / 1e18;
+            }
         } else {
-            usdAmount = amount; // Already 18 decimals
+            // No price feed configured - assume 1:1 USD peg (current behavior)
+            if (decimals <= 17) {
+                usdAmount = amount * (10 ** (18 - decimals));
+            } else if (decimals >= 19) {
+                usdAmount = amount / (10 ** (decimals - 18));
+            } else {
+                usdAmount = amount; // Already 18 decimals
+            }
         }
 
         // Ensure hard cap not exceeded (check with intended amount first)
@@ -539,12 +530,28 @@ PausableUpgradeable
 
         // Recalculate USD amount based on actual received tokens
         uint256 actualUsdAmount;
-        if (decimals <= 17) {
-            actualUsdAmount = actualAmount * (10 ** (18 - decimals));
-        } else if (decimals >= 19) {
-            actualUsdAmount = actualAmount / (10 ** (decimals - 18));
+        if (address(stablecoinPriceFeeds[stablecoin]) != address(0)) {
+            // Use Chainlink price feed to get the actual USD value
+            uint256 stablecoinPriceUSD = getStablecoinPriceUSD(stablecoin);
+            // Calculate USD amount based on actual price
+            if (decimals <= 17) {
+                uint256 normalizedAmount = actualAmount * (10 ** (18 - decimals));
+                actualUsdAmount = (normalizedAmount * stablecoinPriceUSD) / 1e18;
+            } else if (decimals >= 19) {
+                uint256 normalizedAmount = actualAmount / (10 ** (decimals - 18));
+                actualUsdAmount = (normalizedAmount * stablecoinPriceUSD) / 1e18;
+            } else {
+                actualUsdAmount = (actualAmount * stablecoinPriceUSD) / 1e18;
+            }
         } else {
-            actualUsdAmount = actualAmount; // Already 18 decimals
+            // No price feed configured - assume 1:1 USD peg (current behavior)
+            if (decimals <= 17) {
+                actualUsdAmount = actualAmount * (10 ** (18 - decimals));
+            } else if (decimals >= 19) {
+                actualUsdAmount = actualAmount / (10 ** (decimals - 18));
+            } else {
+                actualUsdAmount = actualAmount; // Already 18 decimals
+            }
         }
 
         // Final hard cap check with actual amount
@@ -569,7 +576,6 @@ PausableUpgradeable
     /// @param _endTime Presale end timestamp
     /// @param _hardCapUSD Maximum USD to raise (18 decimals)
     /// @param _ETHPriceFeed Address of ETH/USD Chainlink price feed
-    /// @param _USDTPriceFeed Address of USDT/USD Chainlink price feed
     /// @param _referralRewardPercent Referral reward percentage (2 decimals)
     function _validateInitParams(
         address _mandalaToken,
@@ -578,7 +584,6 @@ PausableUpgradeable
         uint256 _endTime,
         uint256 _hardCapUSD,
         address _ETHPriceFeed,
-        address _USDTPriceFeed,
         uint256 _referralRewardPercent
     ) internal view {
         require(_mandalaToken != address(0), "Invalid token address");
@@ -588,7 +593,6 @@ PausableUpgradeable
         require(_endTime > block.timestamp, "End time must be future");
         require(_hardCapUSD != 0, "Hard cap must be > 0");
         require(_ETHPriceFeed != address(0), "Invalid ETH price feed");
-        require(_USDTPriceFeed != address(0), "Invalid USDT price feed");
         require(_referralRewardPercent < 10001, "Referral reward > 100%");
     }
 
@@ -635,8 +639,6 @@ PausableUpgradeable
         // Add tokens to user's claimable amount
         claimableTokens[buyer] += tokensToGive;
         
-        // Track total claimable tokens across all users
-        totalClaimableTokens += tokensToGive;
 
         // Handle referral if provided and valid
         if (_referrer != address(0) && _referrer != buyer) {
@@ -695,7 +697,6 @@ PausableUpgradeable
         
         // Keep legacy tracking for backward compatibility
         referralRewards[_referrer] += referralReward;
-        totalReferralRewardsAllocated += referralReward;
 
         emit ReferralRewardRecorded(_referrer, buyer, referralReward);
     }
@@ -947,7 +948,7 @@ PausableUpgradeable
     /// @return price ETH price in USD (18 decimals)
     function getETHPriceUSD() public view returns (uint256) {
         (uint80 roundID, int256 price, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) = ETHPriceFeed.latestRoundData();
-        
+
         // Validate price data
         require(price > 0, "Chainlink ETH price <= 0");
         require(answeredInRound >= roundID, "Stale ETH price");
@@ -958,6 +959,36 @@ PausableUpgradeable
 
         // Chainlink price feeds have 8 decimals, convert to 18
         return uint256(price) * 1e10;
+    }
+
+    /// @dev Gets the latest stablecoin price in USD from Chainlink with comprehensive validation
+    /// @param stablecoin Address of the stablecoin
+    /// @return price Stablecoin price in USD (18 decimals)
+    function getStablecoinPriceUSD(address stablecoin) public view returns (uint256) {
+        AggregatorV3Interface priceFeed = stablecoinPriceFeeds[stablecoin];
+        require(address(priceFeed) != address(0), "No price feed for stablecoin");
+
+        (uint80 roundID, int256 price, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) = priceFeed.latestRoundData();
+
+        // Validate price data
+        require(price > 0, "Chainlink stablecoin price <= 0");
+        require(answeredInRound >= roundID, "Stale stablecoin price");
+        require(updatedAt != 0, "Stablecoin round not complete");
+        require(startedAt != 0, "Invalid round start time");
+        require(updatedAt >= startedAt, "Invalid timestamps");
+        require(block.timestamp - updatedAt < priceFeedStalenessThreshold + 1, "Stablecoin price data stale");
+
+        // Get decimals from the price feed
+        uint8 feedDecimals = priceFeed.decimals();
+
+        // Convert to 18 decimals
+        if (feedDecimals < 18) {
+            return uint256(price) * (10 ** (18 - feedDecimals));
+        } else if (feedDecimals > 18) {
+            return uint256(price) / (10 ** (feedDecimals - 18));
+        } else {
+            return uint256(price);
+        }
     }
 
 
@@ -1008,50 +1039,6 @@ PausableUpgradeable
         return roundEndTime - block.timestamp;
     }
 
-    /// @dev Calculates vested token amount for a user with overflow protection
-    /// @param user Address to calculate vested amount for
-    /// @return amount Vested token amount available for claiming
-    function _calculateVestedAmount(address user) internal view returns (uint256) {
-        uint256 totalClaimable = claimableTokens[user];
-        if (totalClaimable <= 0) return 0;
-        
-        // If no vesting schedule, return all tokens
-        if (vestingSchedule.startTime == 0 || vestingSchedule.duration == 0) {
-            return totalClaimable - vestedTokens[user];
-        }
-        
-        uint256 currentTime = block.timestamp;
-        uint256 vestingStart = vestingSchedule.startTime;
-        uint256 cliff = vestingSchedule.cliff;
-        uint256 duration = vestingSchedule.duration;
-        
-        // Before cliff, no tokens are vested
-        if (currentTime < vestingStart + cliff) {
-            return 0;
-        }
-        
-        // After full vesting period, all tokens are vested
-        if (currentTime >= vestingStart + duration) {
-            return totalClaimable - vestedTokens[user];
-        }
-        
-        // Linear vesting between cliff and end with overflow protection
-        uint256 timeElapsed = currentTime - vestingStart;
-        uint256 vestedAmount;
-        
-        // Use safe arithmetic to prevent overflow
-        if (totalClaimable > type(uint256).max / timeElapsed) {
-            // If multiplication would overflow, calculate differently
-            vestedAmount = (totalClaimable / duration) * timeElapsed;
-        } else {
-            // Safe to multiply first
-            vestedAmount = (totalClaimable * timeElapsed) / duration;
-        }
-        
-        // Return only newly vested tokens
-        return vestedAmount > vestedTokens[user] ? vestedAmount - vestedTokens[user] : 0;
-    }
-    
     /// @dev Returns the referral reward type for a given round
     /// @param round Round number to check
     /// @return rewardType USDT or TOKEN
@@ -1078,18 +1065,6 @@ PausableUpgradeable
     /// @return stablecoin Address of primary stablecoin
     function _getAcceptedStablecoin() internal view returns (address) {
         return primaryStablecoin;
-    }
-
-    /// @dev Calculates total tokens needed for all claims including referral rewards
-    /// @return totalNeeded Total tokens that must be available in contract
-    function _calculateTotalTokensNeeded() internal view returns (uint256) {
-        // Convert referral rewards from USD to tokens
-        uint256 referralTokens = (totalReferralRewardsAllocated * 1e18) / tokenPriceUSD;
-        
-        // Add total claimable tokens across all users
-        uint256 totalNeeded = totalClaimableTokens + referralTokens;
-        
-        return totalNeeded;
     }
 
     // ============ ADMIN FUNCTIONS ============
@@ -1160,16 +1135,49 @@ PausableUpgradeable
         emit PrimaryStablecoinUpdated(oldStablecoin, stablecoin);
     }
 
-    /// @dev Updates price feed addresses (only owner)
-    /// @param _ETHPriceFeed New ETH price feed address
-    /// @param _USDTPriceFeed New USDT price feed address
-    function setPriceFeed(address _ETHPriceFeed, address _USDTPriceFeed) external onlyOwner {
-        require(_ETHPriceFeed != address(0), "Invalid ETH price feed");
-        require(_USDTPriceFeed != address(0), "Invalid USDT price feed");
+    /// @dev Sets the price feed for a specific stablecoin (only owner)
+    /// @param stablecoin Address of the stablecoin
+    /// @param priceFeed Address of the Chainlink price feed for this stablecoin
+    function setStablecoinPriceFeed(address stablecoin, address priceFeed) external onlyOwner {
+        require(stablecoin != address(0), "Invalid stablecoin address");
+        require(acceptedStablecoins[stablecoin], "Stablecoin not accepted");
 
+        if (priceFeed != address(0)) {
+            // Validate that the price feed is a valid Chainlink aggregator
+            try AggregatorV3Interface(priceFeed).latestRoundData() returns (
+                uint80, int256 price, uint256, uint256, uint80
+            ) {
+                require(price > 0, "Invalid price feed");
+            } catch {
+                revert("Invalid price feed contract");
+            }
+
+            stablecoinPriceFeeds[stablecoin] = AggregatorV3Interface(priceFeed);
+        } else {
+            // Remove price feed (will default to 1:1 USD peg)
+            delete stablecoinPriceFeeds[stablecoin];
+        }
+
+        emit StablecoinPriceFeedUpdated(stablecoin, priceFeed);
+    }
+
+    /// @dev Updates ETH price feed address (only owner)
+    /// @param _ETHPriceFeed New ETH price feed address
+    function setETHPriceFeed(address _ETHPriceFeed) external onlyOwner {
+        require(_ETHPriceFeed != address(0), "Invalid ETH price feed");
+
+        // Validate that the price feed is a valid Chainlink aggregator
+        try AggregatorV3Interface(_ETHPriceFeed).latestRoundData() returns (
+            uint80, int256 price, uint256, uint256, uint80
+        ) {
+            require(price > 0, "Invalid ETH price feed");
+        } catch {
+            revert("Invalid ETH price feed contract");
+        }
+
+        address oldFeed = address(ETHPriceFeed);
         ETHPriceFeed = AggregatorV3Interface(_ETHPriceFeed);
-        USDTPriceFeed = AggregatorV3Interface(_USDTPriceFeed);
-        emit PriceFeedsUpdated(_ETHPriceFeed, _USDTPriceFeed);
+        emit ETHPriceFeedUpdated(oldFeed, _ETHPriceFeed);
     }
 
 
@@ -1281,60 +1289,6 @@ PausableUpgradeable
         emit FundWalletsUpdated(_walletA, _walletB, _treasuryWallet);
     }
 
-    /// @dev Configures token vesting schedule
-    /// @param cliff Cliff period in seconds
-    /// @param duration Total vesting duration in seconds
-    /// @param vestingStartTime Vesting start time (0 for after presale ends)
-    /// @param revocable Whether vesting can be revoked
-    function configureVestingSchedule(
-        uint256 cliff,
-        uint256 duration,
-        uint256 vestingStartTime,
-        bool revocable
-    ) external onlyOwner {
-        require(duration != 0, "Duration must be positive");
-        require(cliff < duration + 1, "Cliff exceeds duration");
-        
-        // Determine the actual vesting start time
-        uint256 actualStartTime;
-        if (vestingStartTime == 0) {
-            // If 0, default to presale end time (not current timestamp)
-            actualStartTime = endTime;
-        } else {
-            actualStartTime = vestingStartTime;
-        }
-        
-        // Critical validation: vesting must start after presale ends
-        require(
-            actualStartTime >= endTime,
-            "Vesting cannot start before presale ends"
-        );
-        
-        // Additional validation: if presale is active, ensure sufficient time gap
-        if (block.timestamp <= endTime) {
-            // During presale, ensure at least the end time or later
-            require(
-                actualStartTime >= endTime,
-                "Vesting start time must be after presale end time"
-            );
-        } else {
-            // After presale, allow immediate vesting but warn about past dates
-            require(
-                actualStartTime >= endTime,
-                "Vesting start time cannot be before presale ended"
-            );
-        }
-        
-        vestingSchedule = VestingSchedule({
-            cliff: cliff,
-            duration: duration,
-            startTime: actualStartTime,
-            revocable: revocable
-        });
-        
-        emit VestingConfigured(cliff, duration, vestingSchedule.startTime);
-    }
-
     /// @dev Sets fund distribution percentages (only owner)
     /// @param _walletAPercent Percentage for wallet A (basis points: 1000 = 10%)
     /// @param _walletBPercent Percentage for wallet B (basis points: 200 = 2%)
@@ -1426,21 +1380,6 @@ PausableUpgradeable
         
         IERC20(token).safeTransfer(owner(), amount);
         emit TokensRecovered(token, owner(), amount);
-    }
-
-    /// @dev Returns vesting information for a user
-    /// @param user Address to query
-    /// @return total Total claimable tokens
-    /// @return vested Already vested tokens
-    /// @return available Currently available to claim
-    function getVestingInfo(address user) external view returns (
-        uint256 total,
-        uint256 vested,
-        uint256 available
-    ) {
-        total = claimableTokens[user];
-        vested = vestedTokens[user];
-        available = _calculateVestedAmount(user);
     }
 
     /// @dev Returns the current contract version for upgrade validation
