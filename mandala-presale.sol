@@ -413,9 +413,9 @@ PausableUpgradeable
         
         // Enable implementation whitelist by default for security
         implementationWhitelistEnabled = true;
-        
-        // Set default price feed staleness threshold to 24 hours
-        priceFeedStalenessThreshold = 24 hours;
+
+        // Set default price feed staleness threshold to 2 hours
+        priceFeedStalenessThreshold = 2 hours;
         
         // Initialize contract version for upgrade tracking
         contractVersion = 1;
