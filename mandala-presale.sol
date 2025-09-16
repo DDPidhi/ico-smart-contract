@@ -493,8 +493,8 @@ PausableUpgradeable
                 uint256 normalizedAmount = amount * (10 ** (18 - decimals));
                 usdAmount = (normalizedAmount * stablecoinPriceUSD) / 1e18;
             } else if (decimals >= 19) {
-                uint256 normalizedAmount = amount / (10 ** (decimals - 18));
-                usdAmount = (normalizedAmount * stablecoinPriceUSD) / 1e18;
+                // Fix divide-before-multiply: multiply first, then divide
+                usdAmount = (amount * stablecoinPriceUSD) / (10 ** (decimals - 18)) / 1e18;
             } else {
                 usdAmount = (amount * stablecoinPriceUSD) / 1e18;
             }
@@ -538,8 +538,8 @@ PausableUpgradeable
                 uint256 normalizedAmount = actualAmount * (10 ** (18 - decimals));
                 actualUsdAmount = (normalizedAmount * stablecoinPriceUSD) / 1e18;
             } else if (decimals >= 19) {
-                uint256 normalizedAmount = actualAmount / (10 ** (decimals - 18));
-                actualUsdAmount = (normalizedAmount * stablecoinPriceUSD) / 1e18;
+                // Fix divide-before-multiply: multiply first, then divide
+                actualUsdAmount = (actualAmount * stablecoinPriceUSD) / (10 ** (decimals - 18)) / 1e18;
             } else {
                 actualUsdAmount = (actualAmount * stablecoinPriceUSD) / 1e18;
             }
@@ -769,7 +769,7 @@ PausableUpgradeable
         IERC20 usdt = IERC20(usdtAddress);
         
         // Get USDT decimals dynamically for accurate conversion
-        uint8 usdtDecimals;
+        uint8 usdtDecimals = 6; // Initialize with USDT default
         try IERC20Metadata(usdtAddress).decimals() returns (uint8 d) {
             usdtDecimals = d;
         } catch {
@@ -838,7 +838,7 @@ PausableUpgradeable
             IERC20 usdt = IERC20(usdtAddress);
             
             // Get USDT decimals dynamically for accurate conversion
-            uint8 usdtDecimals;
+            uint8 usdtDecimals = 6; // Initialize with USDT default
             try IERC20Metadata(usdtAddress).decimals() returns (uint8 d) {
                 usdtDecimals = d;
             } catch {
