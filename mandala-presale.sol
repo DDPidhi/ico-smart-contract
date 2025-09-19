@@ -3,7 +3,7 @@ pragma solidity 0.8.28;
 
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
@@ -18,6 +18,16 @@ import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol
 interface IVersioned {
     /// @dev Returns the version of the implementation
     function getVersion() external pure returns (uint256);
+}
+
+/**
+ * @title IChainlinkAggregator
+ * @dev Interface for accessing Chainlink aggregator's circuit breaker bounds
+ */
+interface IChainlinkAggregator {
+    function minAnswer() external view returns (int192);
+    function maxAnswer() external view returns (int192);
+    function aggregator() external view returns (address);
 }
 
 /**
@@ -39,7 +49,7 @@ interface IVersioned {
 contract MandalaPresale is
 Initializable,
 UUPSUpgradeable,
-OwnableUpgradeable,
+Ownable2StepUpgradeable,
 ReentrancyGuardUpgradeable,
 PausableUpgradeable
 {
@@ -132,7 +142,7 @@ PausableUpgradeable
     mapping(uint256 => uint256) public roundStartTime;
 
     /// @dev Reward type enum for referral payouts
-    enum RewardType { USDT, TOKEN }
+    enum RewardType { TOKEN, USDT }
 
     /// @dev Mapping of round to reward type
     mapping(uint256 => RewardType) public referralRewardType;
@@ -370,10 +380,10 @@ PausableUpgradeable
         address _walletB,
         address _treasuryWallet
     ) public initializer {
-        // Initialize parent contracts
         __Ownable_init(msg.sender);
-        __UUPSUpgradeable_init();
+        __Ownable2Step_init();
         __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
         __Pausable_init();
 
         // Validate critical parameters
@@ -403,7 +413,7 @@ PausableUpgradeable
         roundStartTime[1] = _startTime; // First round starts when presale starts
         referralRewardType[1] = RewardType.USDT;
         referralRewardType[2] = RewardType.USDT;
-        // Round 3+ defaults to TOKEN (RewardType.TOKEN = 1)
+        // Round 3+ defaults to TOKEN (RewardType.TOKEN = 0, the default value)
 
         // Initialize fund distribution percentages
         walletAPercent = 1000;   // 10%
@@ -440,13 +450,7 @@ PausableUpgradeable
         // Calculate USD equivalent of ETH sent
         uint256 usdAmount = (msg.value * ethPriceUSD) / 1e18;
 
-        // Ensure hard cap not exceeded
-        require(
-            totalRaisedUSD + usdAmount < hardCapUSD + 1,
-            "Hard cap would be exceeded"
-        );
-
-        // Process the purchase
+        // Process the purchase (hard cap checked by withinHardCap modifier)
         _processPurchase(msg.sender, usdAmount, _referrer, address(0), msg.value);
 
         // Distribute ETH funds immediately
@@ -509,12 +513,6 @@ PausableUpgradeable
             }
         }
 
-        // Ensure hard cap not exceeded (check with intended amount first)
-        require(
-            totalRaisedUSD + usdAmount < hardCapUSD + 1,
-            "Hard cap would be exceeded"
-        );
-
         // Check balance before transfer to handle fee-on-transfer tokens
         uint256 balanceBefore = stablecoinContract.balanceOf(address(this));
 
@@ -554,7 +552,7 @@ PausableUpgradeable
             }
         }
 
-        // Final hard cap check with actual amount
+        // Final hard cap check with actual received amount (essential for fee-on-transfer tokens)
         require(
             totalRaisedUSD + actualUsdAmount < hardCapUSD + 1,
             "Hard cap would be exceeded with actual amount"
@@ -622,7 +620,7 @@ PausableUpgradeable
 
         // Calculate referee bonus tokens if referral is provided and valid
         uint256 bonusTokens = 0;
-        if (_referrer != address(0) && _referrer != buyer && refereeRewardPercent > 0) {
+        if (_referrer != address(0) && _referrer != buyer && refereeRewardPercent != 0) {
             // Calculate bonus tokens based on referee reward percentage
             bonusTokens = (tokensToGive * refereeRewardPercent) / 10000;
             tokensToGive += bonusTokens; // Add bonus tokens to the buyer's allocation
@@ -691,7 +689,10 @@ PausableUpgradeable
             
             // Automatically add tokens to referrer's purchased balance (immediate ownership, no claiming needed)
             tokensPurchased[_referrer] += tokensToAdd;
-            
+
+            // Also update claimableTokens to ensure tokens are distributed after TGE
+            claimableTokens[_referrer] += tokensToAdd;
+
             emit ReferralTokensAdded(_referrer, tokensToAdd, referralReward);
         }
         
@@ -707,7 +708,7 @@ PausableUpgradeable
     function _distributeFunds(uint256 amount, bool isETH) internal {
         uint256 toWalletA = (amount * walletAPercent) / 10000;
         uint256 toWalletB = (amount * walletBPercent) / 10000;
-        uint256 toTreasury = (amount * treasuryPercent) / 10000;
+        uint256 toTreasury = amount - toWalletA - toWalletB; // Give remainder to treasury
 
         if (isETH) {
             // Distribute ETH
@@ -730,10 +731,10 @@ PausableUpgradeable
     function _distributeStablecoinFunds(address stablecoin, uint256 amount) internal {
         require(stablecoin != address(0), "Invalid stablecoin");
         require(acceptedStablecoins[stablecoin], "Stablecoin not accepted");
-        
+
         uint256 toWalletA = (amount * walletAPercent) / 10000;
         uint256 toWalletB = (amount * walletBPercent) / 10000;
-        uint256 toTreasury = (amount * treasuryPercent) / 10000;
+        uint256 toTreasury = amount - toWalletA - toWalletB; // Give remainder to treasury
 
         IERC20 token = IERC20(stablecoin);
         
@@ -816,11 +817,11 @@ PausableUpgradeable
         uint256 totalDistributed = 0;
         uint256 successCount = 0;
         
-        for (uint256 i = 0; i < referrers.length; i++) {
+        for (uint256 i = 0; i < referrers.length; ++i) {
             address referrer = referrers[i];
             uint256 usdtRewards = referralRewardsUSDT[referrer];
             
-            if (usdtRewards > 0) {
+            if (usdtRewards != 0) {
                 // Clear the rewards first (prevents reentrancy)
                 referralRewardsUSDT[referrer] = 0;
                 
@@ -860,12 +861,15 @@ PausableUpgradeable
         (uint80 roundID, int256 price, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) = ETHPriceFeed.latestRoundData();
 
         // Validate price data
-        require(price > 0, "Chainlink ETH price <= 0");
+        require(price != 0, "Chainlink ETH price <= 0");
         require(answeredInRound >= roundID, "Stale ETH price");
         require(updatedAt != 0, "ETH round not complete");
         require(startedAt != 0, "Invalid round start time");
         require(updatedAt >= startedAt, "Invalid timestamps");
         require(block.timestamp - updatedAt < priceFeedStalenessThreshold + 1, "ETH price data is stale");
+
+        // Circuit breaker protection: check against Chainlink's minAnswer/maxAnswer
+        _validatePriceAgainstCircuitBreaker(address(ETHPriceFeed), price);
 
         // Chainlink price feeds have 8 decimals, convert to 18
         return uint256(price) * 1e10;
@@ -881,12 +885,15 @@ PausableUpgradeable
         (uint80 roundID, int256 price, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) = priceFeed.latestRoundData();
 
         // Validate price data
-        require(price > 0, "Chainlink stablecoin price <= 0");
+        require(price != 0, "Chainlink stablecoin price <= 0");
         require(answeredInRound >= roundID, "Stale stablecoin price");
         require(updatedAt != 0, "Stablecoin round not complete");
         require(startedAt != 0, "Invalid round start time");
         require(updatedAt >= startedAt, "Invalid timestamps");
         require(block.timestamp - updatedAt < priceFeedStalenessThreshold + 1, "Stablecoin price data stale");
+
+        // Circuit breaker protection: check against Chainlink's minAnswer/maxAnswer
+        _validatePriceAgainstCircuitBreaker(address(priceFeed), price);
 
         // Get decimals from the price feed
         uint8 feedDecimals = priceFeed.decimals();
@@ -953,22 +960,10 @@ PausableUpgradeable
     /// @param round Round number to check
     /// @return rewardType USDT or TOKEN
     function _getReferralRewardType(uint256 round) internal view returns (RewardType) {
-        // For rounds 1-2, the mapping is explicitly set in initialize()
-        // For rounds 3+, we check if the mapping was explicitly set via setReferralRewardType()
-        // Since the mapping defaults to 0 (USDT), we can distinguish custom values:
-        // - If round <= 2: always use mapping (set in initialize)
-        // - If round > 2 and mapping == USDT: custom override to USDT
-        // - If round > 2 and mapping == TOKEN: could be default (not set) or custom
-        
-        if (round <= 2) {
-            // Rounds 1-2 are explicitly set in initialize(), always use mapping
-            return referralRewardType[round];
-        } else {
-            // For rounds 3+, default is TOKEN
-            // If mapping is USDT, it means owner explicitly set it to USDT (custom)
-            // If mapping is TOKEN, use it (whether default or explicitly set doesn't matter)
-            return referralRewardType[round] == RewardType.USDT ? RewardType.USDT : RewardType.TOKEN;
-        }
+        // Since TOKEN is now value 0 (the default), the mapping works perfectly:
+        // - Rounds 1-2: explicitly set to USDT in initialize()
+        // - Rounds 3+: default to TOKEN (0) unless owner explicitly sets to USDT
+        return referralRewardType[round];
     }
     
     /// @dev Returns the primary stablecoin for referral payouts
@@ -982,7 +977,7 @@ PausableUpgradeable
     /// @dev Sets the token price (only owner)
     /// @param _tokenPriceUSD New price in USD (18 decimals)
     function setTokenPrice(uint256 _tokenPriceUSD) external onlyOwner {
-        require(_tokenPriceUSD != 0, "Price must be > 0");
+        require(_tokenPriceUSD != 0, "Price must be != 0");
         uint256 oldPrice = tokenPriceUSD;
         tokenPriceUSD = _tokenPriceUSD;
         emit TokenPriceUpdated(oldPrice, _tokenPriceUSD);
@@ -1022,7 +1017,7 @@ PausableUpgradeable
             acceptedStablecoinsList.push(stablecoin);
         } else if (!accepted && wasAccepted) {
             // Remove from list if no longer accepted
-            for (uint256 i = 0; i < acceptedStablecoinsList.length; i++) {
+            for (uint256 i = 0; i < acceptedStablecoinsList.length; ++i) {
                 if (acceptedStablecoinsList[i] == stablecoin) {
                     // Move last element to this position and pop
                     acceptedStablecoinsList[i] = acceptedStablecoinsList[acceptedStablecoinsList.length - 1];
@@ -1057,7 +1052,7 @@ PausableUpgradeable
             try AggregatorV3Interface(priceFeed).latestRoundData() returns (
                 uint80, int256 price, uint256, uint256, uint80
             ) {
-                require(price > 0, "Invalid price feed");
+                require(price != 0, "Invalid price feed");
             } catch {
                 revert("Invalid price feed contract");
             }
@@ -1080,7 +1075,7 @@ PausableUpgradeable
         try AggregatorV3Interface(_ETHPriceFeed).latestRoundData() returns (
             uint80, int256 price, uint256, uint256, uint80
         ) {
-            require(price > 0, "Invalid ETH price feed");
+            require(price != 0, "Invalid ETH price feed");
         } catch {
             revert("Invalid ETH price feed contract");
         }
@@ -1104,7 +1099,7 @@ PausableUpgradeable
         // Distribute according to allocation percentages
         uint256 toWalletA = (tokenBalance * walletAPercent) / 10000;
         uint256 toWalletB = (tokenBalance * walletBPercent) / 10000;
-        uint256 toTreasury = (tokenBalance * treasuryPercent) / 10000;
+        uint256 toTreasury = tokenBalance - toWalletA - toWalletB; // Give remainder to treasury
 
         token.safeTransfer(walletA, toWalletA);
         token.safeTransfer(walletB, toWalletB);
@@ -1173,7 +1168,7 @@ PausableUpgradeable
     /// @dev Sets the duration for each round (only owner)
     /// @param duration Duration in seconds (e.g., 5 days = 432000)
     function setRoundDuration(uint256 duration) external onlyOwner {
-        require(duration > 0, "Duration must be positive");
+        require(duration != 0, "Duration must be positive");
         require(duration <= 30 days, "Duration too long"); // Maximum 30 days for safety
         uint256 oldDuration = roundDuration;
         roundDuration = duration;
@@ -1246,6 +1241,28 @@ PausableUpgradeable
         emit PriceFeedStalenessThresholdUpdated(oldThreshold, threshold);
     }
 
+    /// @dev Validates price against Chainlink's circuit breaker bounds (minAnswer/maxAnswer)
+    /// @param priceFeedAddress Address of the price feed (proxy)
+    /// @param price The price returned from latestRoundData
+    function _validatePriceAgainstCircuitBreaker(address priceFeedAddress, int256 price) internal view {
+        try IChainlinkAggregator(priceFeedAddress).aggregator() returns (address aggregatorAddress) {
+            // Get the actual aggregator contract address from the proxy
+            try IChainlinkAggregator(aggregatorAddress).minAnswer() returns (int192 minAnswer) {
+                try IChainlinkAggregator(aggregatorAddress).maxAnswer() returns (int192 maxAnswer) {
+                    // Validate price is not at circuit breaker bounds (as suggested by auditor)
+                    require(price > int256(minAnswer), "Price at or below circuit breaker minimum");
+                    require(price < int256(maxAnswer), "Price at or above circuit breaker maximum");
+                } catch {
+                    // maxAnswer not available, skip validation
+                }
+            } catch {
+                // minAnswer not available, skip validation
+            }
+        } catch {
+            // aggregator() function not available or not a proxy, skip validation
+        }
+    }
+
     // ============ UPGRADE AUTHORIZATION ============
 
     /// @dev Authorizes contract upgrades (required for UUPS pattern)
@@ -1295,7 +1312,7 @@ PausableUpgradeable
     /// @dev Returns the current contract version for upgrade validation
     /// @return version Current implementation version
     function getVersion() external pure returns (uint256) {
-        return 2; // Version 2: Added round timing functionality
+        return 3; // Version 3: Added audit fixes
     }
 
     /// @dev Fallback function to handle calls to non-existent functions
