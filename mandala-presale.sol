@@ -387,7 +387,7 @@ PausableUpgradeable
         __Pausable_init();
 
         // Validate critical parameters
-        _validateInitParams(_mandalaToken, _tokenPriceUSD, _startTime, _endTime, _hardCapUSD, _ETHPriceFeed, _referralRewardPercent);
+        _validateInitParams(_mandalaToken, _tokenPriceUSD, _startTime, _endTime, _hardCapUSD, _ETHPriceFeed, _referralRewardPercent, _refereeRewardPercent);
 
         // Set initial values
         mandalaToken = IERC20(_mandalaToken);
@@ -513,6 +513,12 @@ PausableUpgradeable
             }
         }
 
+        // Ensure hard cap not exceeded (pre-transfer check for gas efficiency)
+        require(
+            totalRaisedUSD + usdAmount < hardCapUSD + 1,
+            "Hard cap would be exceeded"
+        );
+
         // Check balance before transfer to handle fee-on-transfer tokens
         uint256 balanceBefore = stablecoinContract.balanceOf(address(this));
 
@@ -552,13 +558,7 @@ PausableUpgradeable
             }
         }
 
-        // Final hard cap check with actual received amount (essential for fee-on-transfer tokens)
-        require(
-            totalRaisedUSD + actualUsdAmount < hardCapUSD + 1,
-            "Hard cap would be exceeded with actual amount"
-        );
-
-        // Process the purchase with actual received amount
+        // Process the purchase with actual received amount (withinHardCap modifier handles validation)
         _processPurchase(msg.sender, actualUsdAmount, _referrer, stablecoin, actualAmount);
 
         // Distribute stablecoin funds immediately (same as ETH)
@@ -575,6 +575,7 @@ PausableUpgradeable
     /// @param _hardCapUSD Maximum USD to raise (18 decimals)
     /// @param _ETHPriceFeed Address of ETH/USD Chainlink price feed
     /// @param _referralRewardPercent Referral reward percentage (2 decimals)
+    /// @param _refereeRewardPercent Referee reward percentage (2 decimals)
     function _validateInitParams(
         address _mandalaToken,
         uint256 _tokenPriceUSD,
@@ -582,7 +583,8 @@ PausableUpgradeable
         uint256 _endTime,
         uint256 _hardCapUSD,
         address _ETHPriceFeed,
-        uint256 _referralRewardPercent
+        uint256 _referralRewardPercent,
+        uint256 _refereeRewardPercent
     ) internal view {
         require(_mandalaToken != address(0), "Invalid token address");
         require(_tokenPriceUSD != 0, "Token price must be > 0");
@@ -592,6 +594,7 @@ PausableUpgradeable
         require(_hardCapUSD != 0, "Hard cap must be > 0");
         require(_ETHPriceFeed != address(0), "Invalid ETH price feed");
         require(_referralRewardPercent < 10001, "Referral reward > 100%");
+        require(_refereeRewardPercent < 10001, "Referee reward > 100%");
     }
 
 
